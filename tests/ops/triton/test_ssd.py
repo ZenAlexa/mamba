@@ -76,3 +76,36 @@ def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     out_ref = torch.cat(out_ref, dim=0)
     print(f"Max diff = {(out - out_ref).abs().max().item()}")
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
+def test_fused_scan_continues_convolution_history():
+    pytest.importorskip("causal_conv1d")
+    torch.manual_seed(91)
+    batch, seqlen, heads, headdim, dstate, width, split = 2, 68, 4, 8, 8, 4, 33
+    dim = heads * headdim
+    channels = dim + 2 * dstate
+
+    def rand(*shape):
+        return (torch.randn(shape, device="cuda") * 0.25).requires_grad_()
+
+    x = rand(batch, seqlen, 2 * dim + 2 * dstate + heads)
+    weight, bias = rand(channels, width), rand(channels)
+    dt_bias, a, d = rand(heads), -torch.linspace(0.1, 0.7, heads, device="cuda"), rand(heads)
+
+    def run(z, **state):
+        return mamba_split_conv1d_scan_combined(z, weight, bias, dt_bias, a, d, 32,
+                                                headdim=headdim, return_final_states=True, **state)
+
+    whole, whole_state = run(x)
+    _, ssm_state = run(x[:, :split])
+    history = x[:, split - width + 1:split, dim:dim + channels].transpose(1, 2).contiguous()
+    tail, tail_state = run(x[:, split:], initial_states=ssm_state, initial_conv_states=history)
+    inputs = (x, weight, bias, dt_bias, d)
+    seed = (torch.randn_like(tail), torch.randn_like(tail_state))
+    ref = (whole[:, split:], whole_state)
+    split_out = (tail, tail_state)
+    ref_grad = torch.autograd.grad(ref, inputs, seed)
+    split_grad = torch.autograd.grad(split_out, inputs, seed)
+    for actual, expected in zip(split_out + split_grad, ref + ref_grad):
+        if not torch.allclose(actual, expected, rtol=1e-2, atol=2e-3):
+            pytest.fail(f"split convolution history mismatch: max error {(actual - expected).abs().max().item()}")

@@ -823,7 +823,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
     @custom_fwd
     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
-                ngroups=1, norm_before_gate=True, state_dtype=None):
+                ngroups=1, norm_before_gate=True, state_dtype=None, initial_conv_states=None):
         assert activation in [None, "silu", "swish"]
         if D.dim() == 1:
             assert headdim is not None
@@ -843,7 +843,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange(ensure_stride(xBC), "b s d -> b d s"),
-                conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
+                conv1d_weight, conv1d_bias, seq_idx, initial_conv_states, None, activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
@@ -886,7 +886,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         else:
             assert outproj_bias is None
         ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
-                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
+                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, initial_conv_states)
         ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
         ctx.activation = activation
@@ -901,7 +901,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, dout, *args):
-        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
+        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, initial_conv_states = ctx.saved_tensors
         dfinal_states = args[0] if ctx.return_final_states else None
         headdim = ctx.headdim
         nheads = D.shape[0]
@@ -918,7 +918,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         # Recompute x, B, C
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange(ensure_stride(xBC), "b s d -> b d s"),
-                conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
+                conv1d_weight, conv1d_bias, seq_idx, initial_conv_states, None, ctx.activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
@@ -966,21 +966,22 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None
         else:
             doutproj_weight, doutproj_bias = None, None
-        dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
+        dxBC_given_update, dweight, dbias, dinitial_conv_states = causal_conv1d_bwd_function(
             rearrange(ensure_stride(xBC), "b s d -> b d s"), conv1d_weight, conv1d_bias,
             # It might be okay to not run ensure_stride on dxBC, but we're not sure. So playing safe here.
-            rearrange(ensure_stride(dxBC), "b s d -> b d s"), seq_idx, None, None,
-            rearrange(ensure_stride(dxBC_given), "b s d -> b d s"), False, ctx.activation in ["silu", "swish"]
+            rearrange(ensure_stride(dxBC), "b s d -> b d s"), seq_idx, initial_conv_states, None,
+            rearrange(ensure_stride(dxBC_given), "b s d -> b d s"),
+            initial_conv_states is not None and initial_conv_states.requires_grad, ctx.activation in ["silu", "swish"]
         )
         dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
         if dxBC_given.stride() != dxBC_given_update.stride():
             dxBC_given.copy_(dxBC_given_update)
         else:
             dxBC_given = dxBC_given_update
-        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None
+        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, dinitial_conv_states
 
 
-def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, state_dtype=None):
+def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, state_dtype=None, initial_conv_states=None):
     """
     Argument:
         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
@@ -990,6 +991,7 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
         A: (nheads)
         D: (nheads, headdim) or (nheads,)
         initial_states: (batch, nheads, headdim, dstate)
+        initial_conv_states: (batch, dim + 2 * ngroups * dstate, width - 1), preceding pre-convolution xBC values (without seq_idx)
         seq_idx: (batch, seqlen), int32
         rmsnorm_weight: (dim,)
         outproj_weight: (out_dim, dim)
@@ -1000,7 +1002,11 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
     Return:
         out: (batch, seqlen, dim)
     """
-    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, state_dtype)
+    if initial_conv_states is not None and seq_idx is not None:
+        raise ValueError("initial_conv_states is not supported with seq_idx")
+    if initial_conv_states is not None and initial_conv_states.stride(1) != 1:
+        initial_conv_states = initial_conv_states.transpose(1, 2).contiguous().transpose(1, 2)
+    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, state_dtype, initial_conv_states)
 
 
 def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, dt_limit=(0.0, float("inf")), activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
